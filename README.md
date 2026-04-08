@@ -1,34 +1,33 @@
 # HeteroPULL: PU Learning for Drug Repurposing on Heterogeneous Biomedical Graphs
 
-PULL (Kim et al., AAAI 2025) 을 이종 그래프 환경(Hetionet)으로 확장하여 약물 재창출(drug repurposing) 후보 약물–질병 쌍을 발굴하는 링크 예측 모델.
+PULL (Kim et al., AAAI 2025) 의 Expected Graph 기반 PU learning 프레임워크를 이종 그래프(Hetionet) 환경으로 확장하여 약물 재창출(drug repurposing) 후보 약물–질병 쌍을 발굴하는 링크 예측 모델.
 
 ## 핵심 기여 (논문 반영 포인트)
 
-### 1. HGT 기반 이종 메시지 패싱
-- **HGTConv** (Hu et al., WWW 2020) 를 encoder 로 채택. 노드/엣지 타입별 `W_msg, W_att, W_v` 를 학습하고 type-specific attention softmax 로 메시지를 정규화하므로, 단순 `HeteroConv(sum)` 에서 발생하는 **root feature over-counting** 문제가 구조적으로 발생하지 않는다.
-- `src/model_hetionet.py` 의 `HeteroPULLModel.encode()` 참조.
+### 1. PULL 의 Expected Graph 프레임워크를 이종 그래프로 확장
+원본 PULL 은 동종(homogeneous) 그래프에서만 정의된다. HeteroPULL 은:
+- **HGT (Hu et al., WWW 2020)** 를 encoder 로 채택하여 노드/엣지 타입별 type-specific attention 을 수행.
+- PULL 의 두 축 loss — **L_E (Expected Graph Loss)** 와 **L_C (Correction Loss)** — 를 이종 그래프의 treats 관계 (Compound→Disease) 위에서 정의.
 
-### 2. Target Leakage 방지 — Disjoint MP / Supervision Split
-- 링크 예측에서 자주 발생하는 leakage: supervision edge 가 encoder 의 message passing 그래프에도 포함되는 경우 (Hu et al., OGB).
-- `main_hetionet.py` 의 `RandomLinkSplit(disjoint_train_ratio=0.3)` 으로 학습용 엣지를 (a) MP 전용 70%, (b) supervision 전용 30% 로 분리.
-- `src/train_hetionet.py` 의 `_build_mp_edge_dict()` 가 encoder 입력에서 supervision edge 를 명시적으로 제거하여 이중 보강.
+$$L = L_E + \lambda_c \cdot L_C$$
 
-### 3. Non-negative PU Loss
-- 약물–질병 그래프에서 unlabeled 쌍은 음성이 아니라 **missing positive** 일 가능성이 높다. 단순 BCE + random negative sampling 은 biased risk estimator 이다.
-- **nnPU loss** (Kiryo, Niu, du Plessis, Sugiyama; NeurIPS 2017) 도입:
+- **L_E**: 원본 treats 엣지 + 모델이 confident 하게 예측한 top-K pseudo-positive (확장 엣지) 위에서 BCE. 확장 엣지는 sigmoid 확신도를 soft weight 으로 사용.
+- **L_C**: 원본 treats 엣지만으로 계산하는 BCE. 모델이 pseudo-label 에 과적합하지 않도록 ground-truth 에 anchoring.
 
-  $$R_{\text{pu}}(f) = \pi_p \cdot R_p^+(f) + \max\{0,\; R_u^-(f) - \pi_p \cdot R_p^-(f)\}$$
+### 2. Bounded Graph Expansion with Confidence Threshold
+매 outer epoch 마다 `|E_exp| = r · |E_orig| · (epoch − 1)` 개의 쌍을 score 상위에서 선택하되:
+- `confidence_threshold` 이상인 쌍만 pseudo-positive 로 인정 (품질 하한)
+- `max_edge_ratio` 로 누적 확장 총량을 cap (over-expansion 방지)
+- 이미 알려진 positive 는 0으로 마스킹 후 top-K
 
-  - $R_p^+ = \mathbb{E}_{x \sim P}[\ell(f(x), +1)]$
-  - $R_p^- = \mathbb{E}_{x \sim P}[\ell(f(x), -1)]$
-  - $R_u^- = \mathbb{E}_{x \sim U}[\ell(f(x), -1)]$
-  - $\ell$: logistic surrogate (softplus)
-- Non-negative correction (Eq.6 of Kiryo et al.): negative risk 가 $-\beta$ 미만이 되면 $-\gamma \cdot (R_u^- - \pi_p R_p^-)$ 만 backprop 하여 over-fitting 시 risk 발산을 막는다.
-- class prior $\pi_p \approx |\text{treats}| / (|\text{Compound}| \times |\text{Disease}|)$ 로 추정.
-- `src/train_hetionet.py` 의 `nnpu_loss()`, `estimate_class_prior()` 참조.
+### 3. Target Leakage 방지
+- Val/Test 엣지는 RandomLinkSplit 으로 분리되며, encoder 평가 시 `train_data.edge_index_dict` 만 사용해 val/test positive 가 encoder 에 노출되지 않도록 보장.
+- Val/Test AUC 계산은 RandomLinkSplit 이 반환한 `edge_label_index` + `edge_label` 을 그대로 사용 (pos/neg 혼합을 올바르게 label 로 구분).
 
-### 4. Heuristic Pseudo-labeling 제거
-- 기존 PULL 의 top-K graph expansion 은 self-training 에 가까운 휴리스틱이었음. HeteroPULL 에서는 이를 제거하고 nnPU 의 unbiased risk estimator 로 대체하여 수학적으로 방어 가능한 PU learning 로 전환.
+### 4. Compound Morgan Fingerprint Feature
+- Hetionet 원본 JSON 의 InChI 로부터 RDKit 으로 **512-bit Morgan fingerprint (radius=2)** 를 생성하여 Compound 노드의 input feature 로 사용.
+- Disease 노드는 학습 가능한 embedding 사용.
+- `get_compound_features()` 는 `node_mapping['Compound']` 인덱스에 정렬된 행렬을 직접 할당하여 순서 의존성 제거.
 
 ## 코드 구조
 ```
@@ -36,22 +35,29 @@ PULL (Kim et al., AAAI 2025) 을 이종 그래프 환경(Hetionet)으로 확장�
 ├── main_hetionet.py          # 학습/평가 엔트리 포인트
 ├── preprocess_hetionet.py    # Hetionet JSON → PyG HeteroData 전처리
 ├── src/
-│   ├── model_hetionet.py     # HeteroPULLModel (HGT + inner-product decoder)
-│   └── train_hetionet.py     # nnPU training loop, test, candidate ranking
+│   ├── model_hetionet.py     # HeteroPULLModel (HGT encoder + inner-product decoder)
+│   └── train_hetionet.py     # PULL 학습 루프 (L_E + L_C), graph expansion, test, candidate ranking
 └── data/
-    └── hetionet_data.pt      # 전처리 결과 (gitignored)
+    ├── hetionet-v1.0.json.bz2 (원본)
+    └── hetionet_data.pt       # 전처리 결과 (gitignored)
 ```
 
 ## 환경
 - `python >= 3.8`
 - `pytorch >= 1.13`
 - `torch-geometric >= 2.3`
+- `rdkit`
 - `scikit-learn`
 
 ## 실행
 ```bash
+# 1) 전처리
 python preprocess_hetionet.py
-python main_hetionet.py --epochs 10 --lr 0.01 --hidden_dim 128 --out_dim 64 --heads 4 --layers 2
+
+# 2) 학습
+python main_hetionet.py --epochs 100 --lr 0.003 --hidden_dim 128 --out_dim 64 \
+                        --heads 4 --layers 2 --growth_rate 0.03 \
+                        --confidence_threshold 0.85 --lambda_c 1.0
 ```
 
 ## 주요 하이퍼파라미터
@@ -61,12 +67,16 @@ python main_hetionet.py --epochs 10 --lr 0.01 --hidden_dim 128 --out_dim 64 --he
 | `--out_dim` | 64 | 최종 임베딩 차원 |
 | `--heads` | 4 | HGT attention heads |
 | `--layers` | 2 | HGT layer 수 |
-| `--lr` | 0.01 | Adam learning rate |
-| `inner_steps` | 50 | epoch 당 inner optimization step |
-| `unl_ratio` | 5 | positive 대비 unlabeled batch 배수 |
+| `--lr` | 0.003 | Adam learning rate |
+| `--weight_decay` | 1e-4 | L2 regularization |
+| `--inner_steps` | 50 | outer epoch 당 inner optimization step |
+| `--growth_rate` | 0.03 | epoch 당 확장 비율 r |
+| `--max_edge_ratio` | 1.0 | 원본 대비 최대 확장 cap |
+| `--confidence_threshold` | 0.85 | pseudo-positive 인정 최소 sigmoid 점수 |
+| `--lambda_c` | 1.0 | L_C 가중치 |
+| `--patience` | 20 | Early stopping patience |
 
 ## 참고문헌
 - Kim, J., Park, K. H., Yoon, H., & Kang, U. (2025). **Accurate Link Prediction for Edge-Incomplete Graphs via PU Learning.** *AAAI*.
 - Hu, Z., Dong, Y., Wang, K., & Sun, Y. (2020). **Heterogeneous Graph Transformer.** *WWW*.
-- Kiryo, R., Niu, G., du Plessis, M. C., & Sugiyama, M. (2017). **Positive-Unlabeled Learning with Non-Negative Risk Estimator.** *NeurIPS*.
 - Himmelstein, D. S., et al. (2017). **Systematic integration of biomedical knowledge prioritizes drugs for repurposing (Hetionet).** *eLife*.
