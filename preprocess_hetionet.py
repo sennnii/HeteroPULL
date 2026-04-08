@@ -37,48 +37,43 @@ def load_hetionet_json():
     
     return data
 
-def get_compound_features(hetionet_data):
-    """Compound 노드의 Morgan Fingerprint 생성 (InChI 사용)"""
+def get_compound_features(hetionet_data, compound_mapping, n_bits=512, radius=2):
+    """
+    node_mapping['Compound'] 인덱스에 **정확히 정렬된** Morgan fingerprint 행렬 생성.
+    """
     print("\n[약물 분자 특징 추가]")
-    
-    compounds = [n for n in hetionet_data['nodes'] if n['kind'] == 'Compound']
-    
-    features = []
+
+    n_compounds = len(compound_mapping)
+    features = np.zeros((n_compounds, n_bits), dtype=np.float32)
+    assigned = np.zeros(n_compounds, dtype=bool)
     valid_count = 0
-    failed_compounds = []
-    
+    failed = []
+
+    compounds = [n for n in hetionet_data['nodes'] if n['kind'] == 'Compound']
     for compound in tqdm(compounds, desc="Morgan Fingerprint 생성"):
-        try:
-            # InChI에서 분자 생성
-            inchi = compound.get('data', {}).get('inchi', None)
-            
-            if inchi:
-                mol = Chem.MolFromInchi(inchi)
-                
-                if mol:
-                    # 512-bit Morgan Fingerprint (radius=2)
-                    fp = AllChem.GetMorganFingerprintAsBitVect(mol, 2, nBits=512)
-                    features.append(np.array(fp, dtype=np.float32))
-                    valid_count += 1
-                else:
-                    # InChI 파싱 실패
-                    features.append(np.zeros(512, dtype=np.float32))
-                    failed_compounds.append(compound['name'])
-            else:
-                # InChI 없음
-                features.append(np.zeros(512, dtype=np.float32))
-                failed_compounds.append(compound['name'])
-        except Exception as e:
-            # 예외 발생
-            features.append(np.zeros(512, dtype=np.float32))
-            failed_compounds.append(f"{compound['name']} (Error: {str(e)})")
-    
-    print(f"  ✓ 유효 분자: {valid_count}/{len(compounds)} ({valid_count/len(compounds)*100:.1f}%)")
-    
-    if failed_compounds[:5]:  # 처음 5개만 출력
-        print(f"  ⚠ 실패한 분자 샘플: {failed_compounds[:5]}")
-    
-    return torch.FloatTensor(features)
+        cid = f"Compound::{str(compound['identifier'])}"
+        if cid not in compound_mapping:
+            continue
+        idx = compound_mapping[cid]
+
+        inchi = compound.get('data', {}).get('inchi', None)
+        mol = Chem.MolFromInchi(inchi) if inchi else None
+        if mol is not None:
+            fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius, nBits=n_bits)
+            features[idx] = np.array(fp, dtype=np.float32)
+            valid_count += 1
+        else:
+            failed.append(compound['name'])
+        assigned[idx] = True
+
+    missing = int((~assigned).sum())
+    print(f"  ✓ 유효 분자: {valid_count}/{n_compounds} ({valid_count/n_compounds*100:.1f}%)")
+    if missing:
+        print(f"  ⚠ 매핑되지 않은 Compound index: {missing}개 (zero vector로 채움)")
+    if failed[:5]:
+        print(f"  ⚠ InChI 파싱 실패 샘플: {failed[:5]}")
+
+    return torch.from_numpy(features)
 
 def validate_data_structure(hetionet_data):
     """ 데이터 구조를 검증하고 통계를 출력합니다. """
@@ -146,7 +141,6 @@ def preprocess_hetionet(hetionet_data):
     print("  - 2/4: 엣지 인덱스 생성 중...")
     edge_data = defaultdict(lambda: [[], []])
     
-    skipped_edges = []
     skipped_edges_count = 0
 
     for edge in tqdm(hetionet_data['edges'], desc="엣지 처리"):
@@ -198,9 +192,9 @@ def preprocess_hetionet(hetionet_data):
 
     print(f"    총 {len(edge_data)}개 엣지 타입 생성")
 
-    # 2.5. 약물 분자 특징 생성
+    # 2.5. 약물 분자 특징 생성 (node_mapping 인덱스에 정렬)
     print("  - 2.5/4: 약물 분자 특징 생성 중...")
-    compound_features = get_compound_features(hetionet_data)
+    compound_features = get_compound_features(hetionet_data, node_mapping['Compound'])
     data['Compound'].x = compound_features
     print(f"    ✓ Compound 특징 shape: {compound_features.shape}")
     
@@ -235,7 +229,7 @@ def preprocess_hetionet(hetionet_data):
     else:
         print("    ⚠ 경고: 'Compound-treats-Disease' 엣지가 없습니다!")
 
-    return data, node_mapping, skipped_edges
+    return data, node_mapping, skipped_edges_count
 
 if __name__ == "__main__":
     # 1. hetionet-v1.0.json.bz2 파일 로드
@@ -245,7 +239,7 @@ if __name__ == "__main__":
     validate_data_structure(hetionet_raw_data)
 
     # 3. HeteroData 객체로 변환
-    hetionet_hetero_data, node_mapping, skipped_edges = preprocess_hetionet(hetionet_raw_data)
+    hetionet_hetero_data, node_mapping, skipped_edges_count = preprocess_hetionet(hetionet_raw_data)
 
     print("\n[전처리 요약]")
     print(hetionet_hetero_data)
@@ -253,14 +247,19 @@ if __name__ == "__main__":
     # 4. 변환된 데이터를 .pt 파일로 저장
     save_path = osp.join('data', 'hetionet_data.pt')
     torch.save(hetionet_hetero_data, save_path)
-    
-    # 5. 디버깅 정보 저장
+
+    # 5. 디버깅 정보 저장 (Hetionet 원본 논문과 대조 가능하도록 edge type 별 카운트 포함)
     debug_path = osp.join('data', 'preprocessing_debug.json')
+    edge_counts = {
+        '::'.join(et): int(hetionet_hetero_data[et].edge_index.shape[1])
+        for et in hetionet_hetero_data.edge_types
+    }
     with open(debug_path, 'w', encoding='utf-8') as f:
         json.dump({
-            'skipped_edges_count': len(skipped_edges),
+            'skipped_edges_count': skipped_edges_count,
             'node_types': list(node_mapping.keys()),
-            'node_counts': {k: len(v) for k, v in node_mapping.items()}
+            'node_counts': {k: len(v) for k, v in node_mapping.items()},
+            'edge_counts': edge_counts,
         }, f, indent=2, ensure_ascii=False)
 
     print(f"\n✓ 전처리 완료!")
