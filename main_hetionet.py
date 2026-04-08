@@ -1,5 +1,6 @@
 import os.path as osp
 import argparse
+import copy
 import random
 import time
 import numpy as np
@@ -159,11 +160,13 @@ def main():
     _full_eval("Ep00")
 
     print("\n[HeteroPULL 학습 시작]")
-    best_val_auc = 0
-    best_test_auc = 0
-    best_val_mrr = 0
-    best_test_mrr = 0
+    print("Early stopping 기준: Val MRR (filtered)")
+    best_val_mrr = -1.0
+    best_val_auc = 0.0
+    best_test_auc = 0.0
+    best_test_mrr = 0.0
     best_epoch = 0
+    best_state_dict = None
     patience_counter = 0
     z_dict_prev = None
 
@@ -193,12 +196,14 @@ def main():
             test_pos_only, train_pos_all, val_pos_only, test_pos_only,
         )
 
-        if val_auc > best_val_auc:
+        curr_val_mrr = val_rank['MRR']
+        if curr_val_mrr > best_val_mrr:
+            best_val_mrr = curr_val_mrr
+            best_test_mrr = test_rank['MRR']
             best_val_auc = val_auc
             best_test_auc = curr_test_auc
-            best_val_mrr = val_rank['MRR']
-            best_test_mrr = test_rank['MRR']
             best_epoch = epoch
+            best_state_dict = copy.deepcopy(model.state_dict())
             patience_counter = 0
         else:
             patience_counter += 1
@@ -215,12 +220,15 @@ def main():
                   f'(Patience: {patience_counter}/{args.patience}, Time: {epoch_time:.2f}s)')
 
     print("\n[학습 완료]")
-    print(f'Best Epoch: {best_epoch:02d}')
+    print(f'Best Epoch (by Val MRR): {best_epoch:02d}')
     print(f'  Val  AUC: {best_val_auc:.4f}  MRR: {best_val_mrr:.4f}')
     print(f'  Test AUC: {best_test_auc:.4f}  MRR: {best_test_mrr:.4f}')
     print(f'총 학습 시간: {(time.time() - start_time):.2f}s')
 
-    # 최종 학습된 모델의 전체 metric 재확인
+    # Best checkpoint 복원 후 최종 평가
+    if best_state_dict is not None:
+        model.load_state_dict(best_state_dict)
+        print(f"\n[Best checkpoint 복원 완료: epoch {best_epoch:02d}]")
     print()
     _full_eval("Final")
 
