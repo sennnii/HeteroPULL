@@ -22,6 +22,12 @@ def parse_args():
     parser.add_argument('--lr', type=float, default=0.003)
     parser.add_argument('--weight_decay', type=float, default=1e-4)
     parser.add_argument('--patience', type=int, default=20)
+    parser.add_argument('--prior', type=float, default=None,
+                        help="nnPU class prior π_p. None이면 |treats|/(|C|·|D|)로 자동 추정. "
+                             "ablation 시 {1e-3, 3e-3, 1e-2, 3e-2} 권장")
+    parser.add_argument('--unl_ratio', type=int, default=5,
+                        help="nnPU unlabeled batch = positive의 k배")
+    parser.add_argument('--inner_steps', type=int, default=50)
     parser.add_argument('--verbose', type=str, default="y")
     return parser.parse_args()
 
@@ -114,8 +120,24 @@ def main():
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
-    # 평가 시 encoder 입력: train MP 그래프만 사용 (test 시점의 transductive leakage 차단)
+    # 평가 시 encoder 입력: train MP(70%) + supervision(30%) 전체 = 전체 training treats.
+    # MP partition 만 쓰면 학습된 정보의 30%가 eval 시점에 인코더에서 사라져 AUC가 손해.
+    # val/test positive는 여전히 포함되지 않으므로 leakage는 없다.
+    tr_mp = train_data[edge_type_to_predict].edge_index
+    tr_sup_mask = train_data[edge_type_to_predict].edge_label > 0.5
+    tr_sup = train_data[edge_type_to_predict].edge_label_index[:, tr_sup_mask]
+    tr_full = torch.cat([tr_mp, tr_sup], dim=1)
     eval_edge_index_dict = {k: v for k, v in train_data.edge_index_dict.items()}
+    eval_edge_index_dict[edge_type_to_predict] = tr_full
+    if rev_edge_type_to_predict in eval_edge_index_dict:
+        eval_edge_index_dict[rev_edge_type_to_predict] = tr_full.flip(0)
+
+    # nnPU class prior
+    if args.prior is None:
+        prior_used = None  # train() 내부에서 자동 추정
+    else:
+        prior_used = args.prior
+        print(f"nnPU prior π_p 수동 지정: {prior_used}")
 
     print("\n[HeteroPULL 학습 시작]")
     best_val_auc = 0
@@ -127,7 +149,10 @@ def main():
     for epoch in range(1, args.epochs + 1):
         epoch_start_time = time.time()
 
-        loss, _ = train(model, optimizer, data, train_data, epoch)
+        loss, _ = train(model, optimizer, data, train_data, epoch,
+                        inner_steps=args.inner_steps,
+                        unl_ratio=args.unl_ratio,
+                        prior=prior_used)
         val_loss, val_auc = test(data, model, val_edges, eval_edge_index_dict)
         curr_test_loss, curr_test_auc = test(data, model, test_edges, eval_edge_index_dict)
 

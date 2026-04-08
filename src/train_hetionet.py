@@ -43,7 +43,7 @@ def estimate_class_prior(data):
 
 
 def train(model, optimizer, data, train_data, epoch,
-          inner_steps=50, unl_ratio=5):
+          inner_steps=50, unl_ratio=5, prior=None):
     device = train_data[EDGE_TYPE].edge_index.device
 
     sup_edge_idx = train_data[EDGE_TYPE].edge_label_index
@@ -57,7 +57,8 @@ def train(model, optimizer, data, train_data, epoch,
     )
 
     edge_index_dict = _build_mp_edge_dict(train_data)
-    prior = estimate_class_prior(data)
+    if prior is None:
+        prior = estimate_class_prior(data)
 
     last_loss = 0.0
     z_dict_new = None

@@ -58,10 +58,10 @@ class HeteroPULLModel(nn.Module):
             x_dict = conv(x_dict, edge_index_dict)
             x_dict = {nt: self.dropout(F.elu(x)) for nt, x in x_dict.items()}
 
-        z_dict = {}
-        for node_type, lin in self.lin_dict.items():
-            z = lin(x_dict[node_type])
-            z_dict[node_type] = F.normalize(z, p=2, dim=-1)
+        # Final projection. F.normalize 를 제거하여 logit dynamic range 확보
+        # (cosine similarity [-1, 1] 은 softplus surrogate 를 포화시키지 못해
+        #  nnPU 의 positive signal 이 gradient 에 거의 기여하지 못하는 문제 회피).
+        z_dict = {nt: lin(x_dict[nt]) for nt, lin in self.lin_dict.items()}
         return z_dict
 
     def decode(self, z_dict, edge_label_index,
