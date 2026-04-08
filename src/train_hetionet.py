@@ -42,13 +42,19 @@ def estimate_class_prior(data):
     return float(min(max(prior, 1e-4), 0.5))
 
 
-def train(model, optimizer, data, train_data, criterion, epoch,
-          z_dict=None, inner_steps=50, unl_ratio=5):
+def train(model, optimizer, data, train_data, epoch,
+          inner_steps=50, unl_ratio=5):
     device = train_data[EDGE_TYPE].edge_index.device
 
     sup_edge_idx = train_data[EDGE_TYPE].edge_label_index
     sup_edge_label = train_data[EDGE_TYPE].edge_label
     sup_edge_idx = sup_edge_idx[:, sup_edge_label > 0.5]
+
+    # 알려진 모든 train positive (MP + supervision)은 unlabeled sampling에서 제외해야
+    # 알려진 양성이 음성으로 잘못 샘플링되지 않는다.
+    all_train_pos = torch.cat(
+        [train_data[EDGE_TYPE].edge_index, sup_edge_idx], dim=1
+    )
 
     edge_index_dict = _build_mp_edge_dict(train_data)
     prior = estimate_class_prior(data)
@@ -61,7 +67,7 @@ def train(model, optimizer, data, train_data, criterion, epoch,
 
         n_unl = sup_edge_idx.size(1) * unl_ratio
         unl_edge_idx = negative_sampling(
-            edge_index=train_data[EDGE_TYPE].edge_index,
+            edge_index=all_train_pos,
             num_nodes=(data['Compound'].num_nodes, data['Disease'].num_nodes),
             num_neg_samples=n_unl,
             method='sparse',
@@ -78,35 +84,36 @@ def train(model, optimizer, data, train_data, criterion, epoch,
 
         last_loss = float(monitored.detach().cpu())
 
-    return last_loss, z_dict_new, sup_edge_idx, None
+    return last_loss, z_dict_new
 
 
 @torch.no_grad()
-def test(data, model, split_edge_index, criterion):
+def test(data, model, split_edges, mp_edge_index_dict):
+    """
+    split_edges: {'index': [2, E] edge_label_index, 'label': [E] 0/1 binary labels}
+    mp_edge_index_dict: encoder 입력용 message passing 그래프
+        (train 시점에는 train_data.edge_index_dict,
+         final test 시점에는 train+val 병합을 권장)
+    """
     model.eval()
-    z_dict = model.encode(data, data.edge_index_dict, None)
+    z_dict = model.encode(data, mp_edge_index_dict, None)
 
-    pos_out = model.decode(z_dict, split_edge_index['pos'])
-    neg_out = model.decode(z_dict, split_edge_index['neg'])
+    logits = model.decode(z_dict, split_edges['index'])
+    labels = split_edges['label'].float().to(logits.device)
 
-    out = torch.cat([pos_out, neg_out]).view(-1)
-    edge_label = torch.cat([
-        torch.ones(pos_out.size(0)),
-        torch.zeros(neg_out.size(0))
-    ], dim=0).to(out.device)
-
-    loss = F.binary_cross_entropy_with_logits(out, edge_label)
-    auc = roc_auc_score(edge_label.cpu().numpy(),
-                        torch.sigmoid(out).cpu().numpy())
+    loss = F.binary_cross_entropy_with_logits(logits, labels)
+    auc = roc_auc_score(labels.cpu().numpy(),
+                        torch.sigmoid(logits).cpu().numpy())
     return loss, auc
 
 
 @torch.no_grad()
-def get_drug_repurposing_candidates(data, model, num_candidates=20,
+def get_drug_repurposing_candidates(data, model, mp_edge_index_dict,
+                                    num_candidates=20,
                                     max_per_disease=3, min_prob=0.5):
     print("\n[약물 재창출 후보 분석 시작]")
     model.eval()
-    z_dict = model.encode(data, data.edge_index_dict, None)
+    z_dict = model.encode(data, mp_edge_index_dict, None)
 
     raw_scores = model.score_all(z_dict).cpu()
 

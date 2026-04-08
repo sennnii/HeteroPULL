@@ -4,9 +4,7 @@ import random
 import time
 import numpy as np
 import torch
-from torch.nn import BCEWithLogitsLoss
 from torch_geometric.transforms import RandomLinkSplit
-from torch_geometric.utils import negative_sampling
 
 from src.model_hetionet import HeteroPULLModel
 from src.train_hetionet import train, test, get_drug_repurposing_candidates
@@ -51,7 +49,11 @@ def main():
         return
 
     print("전처리된 Hetionet 데이터 로드 중...")
-    data = torch.load(data_path)
+    try:
+        data = torch.load(data_path, weights_only=False)
+    except TypeError:
+        # 구 PyTorch 호환 (weights_only 인자 미지원)
+        data = torch.load(data_path)
 
     print("데이터 분할 중 (Train/Val/Test)...")
     edge_type_to_predict = ('Compound', 'treats', 'Disease')
@@ -70,41 +72,37 @@ def main():
 
     train_data, val_data, test_data = transform(data)
 
+    # RandomLinkSplit(neg_sampling_ratio=1.0)은 val/test의 edge_label_index에
+    # positive + negative를 모두 담고, edge_label(1/0)로 구분한다.
+    def _split_edges(split_data):
+        return {
+            'index': split_data[edge_type_to_predict].edge_label_index,
+            'label': split_data[edge_type_to_predict].edge_label,
+        }
+
+    val_edges = _split_edges(val_data)
+    test_edges = _split_edges(test_data)
+
+    # 후보 발굴 시 이미 사용된 positive 엣지를 제외하기 위한 인덱스 저장
+    pos_mask_val = val_edges['label'] > 0.5
+    pos_mask_test = test_edges['label'] > 0.5
     data[edge_type_to_predict]['train_pos_edge_index'] = train_data[edge_type_to_predict].edge_index
-    data[edge_type_to_predict]['val_pos_edge_index'] = val_data[edge_type_to_predict].edge_label_index
-    data[edge_type_to_predict]['test_pos_edge_index'] = test_data[edge_type_to_predict].edge_label_index
-
-    val_edges = {
-        'pos': val_data[edge_type_to_predict].edge_label_index,
-        'neg': val_data[edge_type_to_predict].get(
-            'neg_edge_label_index', torch.empty((2, 0), dtype=torch.long)),
-    }
-    test_edges = {
-        'pos': test_data[edge_type_to_predict].edge_label_index,
-        'neg': test_data[edge_type_to_predict].get(
-            'neg_edge_label_index', torch.empty((2, 0), dtype=torch.long)),
-    }
-
-    for name, split in [('Validation', val_edges), ('Test', test_edges)]:
-        if split['neg'].shape[1] == 0:
-            print(f"  - {name} negative 샘플 생성 중...")
-            split['neg'] = negative_sampling(
-                edge_index=train_data[edge_type_to_predict].edge_index,
-                num_nodes=(data['Compound'].num_nodes, data['Disease'].num_nodes),
-                num_neg_samples=split['pos'].size(1),
-                method='sparse',
-            )
+    data[edge_type_to_predict]['val_pos_edge_index'] = val_edges['index'][:, pos_mask_val]
+    data[edge_type_to_predict]['test_pos_edge_index'] = test_edges['index'][:, pos_mask_test]
 
     data = data.to(device)
     train_data = train_data.to(device)
     for split in (val_edges, test_edges):
-        split['pos'] = split['pos'].to(device)
-        split['neg'] = split['neg'].to(device)
+        split['index'] = split['index'].to(device)
+        split['label'] = split['label'].to(device)
 
+    n_val_pos = int(pos_mask_val.sum())
+    n_test_pos = int(pos_mask_test.sum())
     print("\n[데이터 로드 완료]")
-    print(f"학습용 'treats' 엣지: {train_data[edge_type_to_predict].edge_index.shape[1]}")
-    print(f"검증용 'treats' 엣지 (Pos/Neg): {val_edges['pos'].shape[1]}/{val_edges['neg'].shape[1]}")
-    print(f"테스트용 'treats' 엣지 (Pos/Neg): {test_edges['pos'].shape[1]}/{test_edges['neg'].shape[1]}")
+    print(f"학습용 'treats' MP 엣지: {train_data[edge_type_to_predict].edge_index.shape[1]}")
+    print(f"학습용 'treats' Supervision 엣지: {int((train_data[edge_type_to_predict].edge_label > 0.5).sum())}")
+    print(f"검증용 'treats' 엣지 (Pos/Neg): {n_val_pos}/{val_edges['label'].numel() - n_val_pos}")
+    print(f"테스트용 'treats' 엣지 (Pos/Neg): {n_test_pos}/{test_edges['label'].numel() - n_test_pos}")
 
     model = HeteroPULLModel(
         data=data,
@@ -115,22 +113,23 @@ def main():
     ).to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    criterion = BCEWithLogitsLoss()
+
+    # 평가 시 encoder 입력: train MP 그래프만 사용 (test 시점의 transductive leakage 차단)
+    eval_edge_index_dict = {k: v for k, v in train_data.edge_index_dict.items()}
 
     print("\n[HeteroPULL 학습 시작]")
     best_val_auc = 0
     best_test_auc = 0
     best_epoch = 0
-    z_dict = None
     patience_counter = 0
 
     start_time = time.time()
     for epoch in range(1, args.epochs + 1):
         epoch_start_time = time.time()
 
-        loss, z_dict, _, _ = train(model, optimizer, data, train_data, criterion, epoch, z_dict)
-        val_loss, val_auc = test(data, model, val_edges, criterion)
-        curr_test_loss, curr_test_auc = test(data, model, test_edges, criterion)
+        loss, _ = train(model, optimizer, data, train_data, epoch)
+        val_loss, val_auc = test(data, model, val_edges, eval_edge_index_dict)
+        curr_test_loss, curr_test_auc = test(data, model, test_edges, eval_edge_index_dict)
 
         if val_auc > best_val_auc:
             best_val_auc = val_auc
@@ -152,7 +151,7 @@ def main():
     print(f'Best Epoch: {best_epoch:02d}, Val AUC: {best_val_auc:.4f}, Best Test AUC: {best_test_auc:.4f}')
     print(f'총 학습 시간: {(time.time() - start_time):.2f}s')
 
-    get_drug_repurposing_candidates(data, model, num_candidates=20)
+    get_drug_repurposing_candidates(data, model, eval_edge_index_dict, num_candidates=20)
 
 
 if __name__ == '__main__':
