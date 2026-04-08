@@ -1,6 +1,8 @@
+import os
 import os.path as osp
 import argparse
 import copy
+import json
 import random
 import time
 import numpy as np
@@ -34,6 +36,10 @@ def parse_args():
     parser.add_argument('--lambda_c', type=float, default=1.0,
                         help="Correction loss 가중치: L = L_E + λ_c · L_C")
     parser.add_argument('--verbose', type=str, default="y")
+    parser.add_argument('--result_json', type=str, default=None,
+                        help="지정 시 final metric 을 JSON 파일로 저장 (seed sweep 집계용)")
+    parser.add_argument('--skip_candidates', action='store_true',
+                        help="약물 재창출 후보 top-K 출력 생략 (seed sweep 시 로그 단축용)")
     return parser.parse_args()
 
 
@@ -153,7 +159,18 @@ def main():
               f"Test AUC={t_auc:.4f} AUPRC={t_auprc:.4f} "
               f"MRR={t_rank['MRR']:.4f} H@1={t_rank['Hits@1']:.3f} "
               f"H@3={t_rank['Hits@3']:.3f} H@10={t_rank['Hits@10']:.3f}")
-        return v_auc, t_auc, v_rank['MRR'], t_rank['MRR']
+        return {
+            'val_auc': float(v_auc), 'val_auprc': float(v_auprc),
+            'val_mrr': float(v_rank['MRR']),
+            'val_h1': float(v_rank['Hits@1']),
+            'val_h3': float(v_rank['Hits@3']),
+            'val_h10': float(v_rank['Hits@10']),
+            'test_auc': float(t_auc), 'test_auprc': float(t_auprc),
+            'test_mrr': float(t_rank['MRR']),
+            'test_h1': float(t_rank['Hits@1']),
+            'test_h3': float(t_rank['Hits@3']),
+            'test_h10': float(t_rank['Hits@10']),
+        }
 
     # ---------- Baseline: random init 평가 (학습 전) ----------
     print("\n[Epoch 00 — Baseline: Random Init]")
@@ -230,9 +247,24 @@ def main():
         model.load_state_dict(best_state_dict)
         print(f"\n[Best checkpoint 복원 완료: epoch {best_epoch:02d}]")
     print()
-    _full_eval("Final")
+    final_metrics = _full_eval("Final")
 
-    get_drug_repurposing_candidates(data, model, eval_edge_index_dict, num_candidates=20)
+    if args.result_json is not None:
+        out_dir = osp.dirname(args.result_json)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        payload = {
+            'seed': args.seed,
+            'best_epoch': best_epoch,
+            'args': {k: v for k, v in vars(args).items() if k != 'result_json'},
+            'final': final_metrics,
+        }
+        with open(args.result_json, 'w') as f:
+            json.dump(payload, f, indent=2)
+        print(f"[result_json 저장] {args.result_json}")
+
+    if not args.skip_candidates:
+        get_drug_repurposing_candidates(data, model, eval_edge_index_dict, num_candidates=20)
 
 
 if __name__ == '__main__':
