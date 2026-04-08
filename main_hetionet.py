@@ -7,7 +7,7 @@ import torch
 from torch_geometric.transforms import RandomLinkSplit
 
 from src.model_hetionet import HeteroPULLModel
-from src.train_hetionet import train, test, get_drug_repurposing_candidates
+from src.train_hetionet import train, test, evaluate_ranking, get_drug_repurposing_candidates
 
 
 def parse_args():
@@ -127,9 +127,42 @@ def main():
     # train_data.edge_index_dict 가 정확히 이 조건을 만족한다.
     eval_edge_index_dict = {k: v for k, v in train_data.edge_index_dict.items()}
 
+    # Ranking 평가에 쓸 positive 엣지들 (filtered setting 용)
+    train_pos_all = train_data[edge_type_to_predict].edge_index
+    val_pos_only = val_edges['index'][:, pos_mask_val]
+    test_pos_only = test_edges['index'][:, pos_mask_test]
+
+    def _full_eval(tag):
+        """AUC/AUPRC + MRR/Hits@k 를 val/test 둘 다에 대해 계산해서 한 줄로 출력."""
+        _, v_auc, v_auprc = test(data, model, val_edges, eval_edge_index_dict)
+        _, t_auc, t_auprc = test(data, model, test_edges, eval_edge_index_dict)
+        v_rank = evaluate_ranking(
+            data, model, eval_edge_index_dict,
+            val_pos_only, train_pos_all, val_pos_only, test_pos_only,
+        )
+        t_rank = evaluate_ranking(
+            data, model, eval_edge_index_dict,
+            test_pos_only, train_pos_all, val_pos_only, test_pos_only,
+        )
+        print(f"[{tag}] "
+              f"Val  AUC={v_auc:.4f} AUPRC={v_auprc:.4f} "
+              f"MRR={v_rank['MRR']:.4f} H@1={v_rank['Hits@1']:.3f} "
+              f"H@3={v_rank['Hits@3']:.3f} H@10={v_rank['Hits@10']:.3f}")
+        print(f"[{tag}] "
+              f"Test AUC={t_auc:.4f} AUPRC={t_auprc:.4f} "
+              f"MRR={t_rank['MRR']:.4f} H@1={t_rank['Hits@1']:.3f} "
+              f"H@3={t_rank['Hits@3']:.3f} H@10={t_rank['Hits@10']:.3f}")
+        return v_auc, t_auc, v_rank['MRR'], t_rank['MRR']
+
+    # ---------- Baseline: random init 평가 (학습 전) ----------
+    print("\n[Epoch 00 — Baseline: Random Init]")
+    _full_eval("Ep00")
+
     print("\n[HeteroPULL 학습 시작]")
     best_val_auc = 0
     best_test_auc = 0
+    best_val_mrr = 0
+    best_test_mrr = 0
     best_epoch = 0
     patience_counter = 0
     z_dict_prev = None
@@ -147,12 +180,24 @@ def main():
             confidence_threshold=args.confidence_threshold,
             lambda_c=args.lambda_c,
         )
-        val_loss, val_auc = test(data, model, val_edges, eval_edge_index_dict)
-        curr_test_loss, curr_test_auc = test(data, model, test_edges, eval_edge_index_dict)
+        val_loss, val_auc, val_auprc = test(data, model, val_edges, eval_edge_index_dict)
+        curr_test_loss, curr_test_auc, curr_test_auprc = test(data, model, test_edges, eval_edge_index_dict)
+
+        # Ranking metrics (filtered setting)
+        val_rank = evaluate_ranking(
+            data, model, eval_edge_index_dict,
+            val_pos_only, train_pos_all, val_pos_only, test_pos_only,
+        )
+        test_rank = evaluate_ranking(
+            data, model, eval_edge_index_dict,
+            test_pos_only, train_pos_all, val_pos_only, test_pos_only,
+        )
 
         if val_auc > best_val_auc:
             best_val_auc = val_auc
             best_test_auc = curr_test_auc
+            best_val_mrr = val_rank['MRR']
+            best_test_mrr = test_rank['MRR']
             best_epoch = epoch
             patience_counter = 0
         else:
@@ -164,12 +209,20 @@ def main():
         if args.verbose == 'y':
             epoch_time = time.time() - epoch_start_time
             print(f'Epoch: {epoch:02d}, Loss: {loss:.4f}, |E_exp|: {n_exp}, '
-                  f'Val AUC: {val_auc:.4f}, Test AUC: {curr_test_auc:.4f} '
+                  f'Val AUC: {val_auc:.4f} AUPRC: {val_auprc:.4f} '
+                  f'MRR: {val_rank["MRR"]:.4f} H@10: {val_rank["Hits@10"]:.3f}, '
+                  f'Test AUC: {curr_test_auc:.4f} MRR: {test_rank["MRR"]:.4f} '
                   f'(Patience: {patience_counter}/{args.patience}, Time: {epoch_time:.2f}s)')
 
     print("\n[학습 완료]")
-    print(f'Best Epoch: {best_epoch:02d}, Val AUC: {best_val_auc:.4f}, Best Test AUC: {best_test_auc:.4f}')
+    print(f'Best Epoch: {best_epoch:02d}')
+    print(f'  Val  AUC: {best_val_auc:.4f}  MRR: {best_val_mrr:.4f}')
+    print(f'  Test AUC: {best_test_auc:.4f}  MRR: {best_test_mrr:.4f}')
     print(f'총 학습 시간: {(time.time() - start_time):.2f}s')
+
+    # 최종 학습된 모델의 전체 metric 재확인
+    print()
+    _full_eval("Final")
 
     get_drug_repurposing_candidates(data, model, eval_edge_index_dict, num_candidates=20)
 

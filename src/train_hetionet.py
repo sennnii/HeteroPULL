@@ -1,4 +1,4 @@
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import roc_auc_score, average_precision_score
 import torch
 import torch.nn.functional as F
 from torch_geometric.utils import negative_sampling
@@ -15,7 +15,7 @@ def _build_edge_index_dict(train_data, treats_edge_index):
     if REV_EDGE_TYPE in d:
         d[REV_EDGE_TYPE] = treats_edge_index.flip(0)
     return d
-
+                                                                                                                                                            
 
 @torch.no_grad()
 def expand_graph(model, z_dict, orig_edge_index, epoch,
@@ -180,8 +180,11 @@ def train(model, optimizer, data, train_data, epoch, z_dict_prev=None,
 @torch.no_grad()
 def test(data, model, split_edges, mp_edge_index_dict):
     """
+    AUC/AUPRC 기반 binary classification 평가.
     split_edges: {'index': [2, E], 'label': [E] (1 positive, 0 negative)}
     mp_edge_index_dict: encoder 입력. val/test positive 가 포함되지 않아야 한다.
+
+    Returns: loss, AUC, AUPRC
     """
     model.eval()
     z_dict = model.encode(data, mp_edge_index_dict, None)
@@ -190,9 +193,82 @@ def test(data, model, split_edges, mp_edge_index_dict):
     labels = split_edges['label'].float().to(logits.device)
 
     loss = F.binary_cross_entropy_with_logits(logits, labels)
-    auc = roc_auc_score(labels.cpu().numpy(),
-                        torch.sigmoid(logits).cpu().numpy())
-    return loss, auc
+    probs = torch.sigmoid(logits).cpu().numpy()
+    labels_np = labels.cpu().numpy()
+    auc = roc_auc_score(labels_np, probs)
+    auprc = average_precision_score(labels_np, probs)
+    return loss, auc, auprc
+
+
+@torch.no_grad()
+def evaluate_ranking(data, model, mp_edge_index_dict,
+                     eval_pos_edges, train_pos_edges, val_pos_edges, test_pos_edges):
+    """
+    Knowledge Graph 표준 filtered ranking 평가.
+
+    각 positive (c, d) 에 대해:
+      1. Compound c 와 모든 Disease 의 점수를 계산
+      2. (c, *) 에서 이미 알려진 positive 들은 ranking 에서 제외 (filtered setting)
+      3. 진짜 타겟 d 의 rank 를 기록 (1이 최고)
+
+    Compound-side 와 Disease-side 양방향 ranking 의 평균을 계산한다.
+    표준 metric: MRR, Hits@1, Hits@3, Hits@10.
+
+    reference: Bordes et al. "Translating Embeddings for Modeling Multi-relational Data" (NeurIPS 2013)
+    """
+    model.eval()
+    z_dict = model.encode(data, mp_edge_index_dict, None)
+
+    # 전체 (Compound, Disease) 점수 행렬 [C, D]
+    all_scores = z_dict['Compound'] @ z_dict['Disease'].t()
+    n_c, n_d = all_scores.shape
+    device = all_scores.device
+
+    # Filtered mask: 전체 known positive (train + val + test) 를 집계
+    # 특정 positive 를 평가할 때 "나머지" known positive 들을 제외해 ranking 을 공정화
+    filter_mask = torch.zeros((n_c, n_d), dtype=torch.bool, device=device)
+    for pe in (train_pos_edges, val_pos_edges, test_pos_edges):
+        if pe is not None and pe.numel() > 0:
+            filter_mask[pe[0], pe[1]] = True
+
+    ranks_tail = []  # compound 고정, disease 랭킹 (which disease does this drug treat?)
+    ranks_head = []  # disease 고정, compound 랭킹 (which drug treats this disease?)
+
+    for i in range(eval_pos_edges.size(1)):
+        c = eval_pos_edges[0, i].item()
+        d = eval_pos_edges[1, i].item()
+
+        # --- Tail ranking: score (c, *) ---
+        scores_c = all_scores[c].clone()
+        target_score = scores_c[d].item()
+        # filtered: 다른 known positive 마스킹 (자기 자신은 복구)
+        scores_c[filter_mask[c]] = float('-inf')
+        scores_c[d] = target_score
+        rank_t = (scores_c > target_score).sum().item() + 1
+        ranks_tail.append(rank_t)
+
+        # --- Head ranking: score (*, d) ---
+        scores_d = all_scores[:, d].clone()
+        target_score = scores_d[c].item()
+        scores_d[filter_mask[:, d]] = float('-inf')
+        scores_d[c] = target_score
+        rank_h = (scores_d > target_score).sum().item() + 1
+        ranks_head.append(rank_h)
+
+    ranks = torch.tensor(ranks_tail + ranks_head, dtype=torch.float)
+    mrr = (1.0 / ranks).mean().item()
+    hits1 = (ranks <= 1).float().mean().item()
+    hits3 = (ranks <= 3).float().mean().item()
+    hits10 = (ranks <= 10).float().mean().item()
+
+    return {
+        'MRR': mrr,
+        'Hits@1': hits1,
+        'Hits@3': hits3,
+        'Hits@10': hits10,
+        'mean_rank_tail': float(torch.tensor(ranks_tail, dtype=torch.float).mean()),
+        'mean_rank_head': float(torch.tensor(ranks_head, dtype=torch.float).mean()),
+    }
 
 
 @torch.no_grad()
