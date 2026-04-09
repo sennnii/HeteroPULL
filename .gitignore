@@ -60,3 +60,10 @@ wandb/
 
 # Jupyter
 .ipynb_checkpoints/
+
+# Paper drafts (local only)
+paper_draft.md
+paper/
+*.docx
+*.hwp
+*.hwpx

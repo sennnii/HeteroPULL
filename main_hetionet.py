@@ -35,6 +35,8 @@ def parse_args():
                         help="sigmoid(score) 이 값 이상인 쌍만 pseudo-positive 로 인정")
     parser.add_argument('--lambda_c', type=float, default=1.0,
                         help="Correction loss 가중치: L = L_E + λ_c · L_C")
+    parser.add_argument('--no_morgan', action='store_true',
+                        help="Compound 의 Morgan fingerprint 를 무시하고 learnable embedding 사용 (ablation)")
     parser.add_argument('--verbose', type=str, default="y")
     parser.add_argument('--result_json', type=str, default=None,
                         help="지정 시 final metric 을 JSON 파일로 저장 (seed sweep 집계용)")
@@ -126,6 +128,7 @@ def main():
         out_channels=args.out_dim,
         num_heads=args.heads,
         num_layers=args.layers,
+        use_compound_features=(not args.no_morgan),
     ).to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)

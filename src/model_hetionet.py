@@ -6,15 +6,23 @@ from torch_geometric.nn import HGTConv, Linear
 
 class HeteroPULLModel(nn.Module):
     def __init__(self, data, hidden_channels=128, out_channels=64,
-                 num_heads=4, num_layers=2, dropout=0.3):
+                 num_heads=4, num_layers=2, dropout=0.3,
+                 use_compound_features=True):
         super().__init__()
         self.hidden_channels = hidden_channels
         self.out_channels = out_channels
+        self.use_compound_features = use_compound_features
 
         self.input_lins = nn.ModuleDict()
         self.node_embeds = nn.ModuleDict()
         for node_type in data.node_types:
-            if hasattr(data[node_type], 'x') and data[node_type].x is not None:
+            has_feat = (hasattr(data[node_type], 'x')
+                        and data[node_type].x is not None)
+            # Ablation: Compound feature(Morgan FP) 를 무시하고 learnable
+            # embedding 만 쓰도록 강제.
+            if node_type == 'Compound' and not use_compound_features:
+                has_feat = False
+            if has_feat:
                 in_dim = data[node_type].x.shape[1]
                 self.input_lins[node_type] = nn.Sequential(
                     Linear(in_dim, hidden_channels),
