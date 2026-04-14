@@ -62,7 +62,8 @@ def set_seed(seed):
 
 
 def subsample_treats(train_data, fraction, seed):
-    """train_data의 treats 엣지를 fraction만큼 무작위 샘플링."""
+    """train_data의 treats 엣지를 fraction만큼 무작위 샘플링.
+    Deep clone 후 in-place로 edge_index 교체."""
     full_edge = train_data[EDGE_TYPE].edge_index
     n_full = full_edge.size(1)
     n_keep = max(1, int(n_full * fraction))
@@ -71,12 +72,8 @@ def subsample_treats(train_data, fraction, seed):
     perm = torch.randperm(n_full, generator=g)[:n_keep]
     kept = full_edge[:, perm]
 
-    # train_data를 얕은 복제해서 treats만 교체
-    new_train = copy.copy(train_data)
-    new_train[EDGE_TYPE] = copy.copy(train_data[EDGE_TYPE])
+    new_train = train_data.clone()
     new_train[EDGE_TYPE].edge_index = kept
-    # rev_treats 도 동기화
-    new_train[REV_EDGE_TYPE] = copy.copy(train_data[REV_EDGE_TYPE])
     new_train[REV_EDGE_TYPE].edge_index = kept.flip(0)
     return new_train, n_keep
 
