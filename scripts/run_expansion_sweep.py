@@ -94,7 +94,8 @@ def print_grid(args, summaries):
         print(f"\n{'=' * 70}")
         print(f"Grid: {key} (mean ± std over seeds)")
         print('=' * 70)
-        header = f"{'τ \\ r':>8}  " + "  ".join(f"{r:>14}" for r in args.rs)
+        tau_r_label = 'τ \\ r'
+        header = f"{tau_r_label:>8}  " + "  ".join(f"{r:>14}" for r in args.rs)
         print(header)
         print('-' * len(header))
         for tau in args.taus:

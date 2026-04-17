@@ -57,6 +57,7 @@ data/preprocessing_debug.json
 logs/
 runs/
 wandb/
+results/
 
 # Jupyter
 .ipynb_checkpoints/
